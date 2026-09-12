@@ -1,0 +1,62 @@
+name: ZLM one-time patch 1.5.4
+
+on:
+  push:
+    paths:
+      - .github/workflows/zlm-patch-1.5.4.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch userscript
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('zeta-memory-tampermonkey.user.js')
+          s = path.read_text(encoding='utf-8')
+          s = s.replace('// @version      1.5.3', '// @version      1.5.4', 1)
+          s = s.replace(
+              '// @description  최초 전체 대화 Claude 분할 누적 구축, 최근 50턴 원문, Gemini 증분 요약과 암호화 GitHub 동기화를 제공합니다.',
+              '// @description  최초 전체 대화 Claude 분할 누적 구축, 최근 50턴 로컬 보관, Gemini 증분 요약, 전송 시 장기기억만 삽입합니다.',
+              1,
+          )
+          start = s.index('  async function buildContext(roomId, userText) {')
+          end = s.index('\n  function observeComplete(response, roomId) {', start)
+          replacement = '''  async function buildContext(roomId, userText) {
+            const settings = await getSettings();
+            if (!settings.enabled) return null;
+            const state = await getState();
+            const room = state.rooms[roomId];
+            if (!room) return null;
+            const blocks = normalizeBlocks(room.longMemory.blocks, room.longMemory.content);
+            const overhead = PREFIX.length + SUFFIX.length + 4;
+            const allowed = Math.max(0, Math.min(4000, Number(settings.maxContextChars) || DEFAULT_CONTEXT, MAX_WIRE - userText.length - overhead));
+            if (allowed < 80) return null;
+            const memory = [["주요 사건 타임라인", blocks.eventTimeline], ["약속 · 비밀 · 갈등", blocks.promisesSecrets], ["인물 관계도 · 관계 변화", blocks.relationships], ["현재 상황", blocks.currentSituation], ["등장인물", blocks.characters], ["미해결 떡밥", blocks.unresolvedThreads], ["단기기억 · 지금 진행 중", blocks.shortTermMemory], ["장소 · 물건 · 세계관 설정", blocks.worldState], ["중요한 원문 대사", blocks.keyDialogue]]
+              .filter(([, value]) => value)
+              .map(([title, value]) => `### ${title}\\n${value}`)
+              .join("\\n\\n")
+              .slice(0, allowed)
+              .trim();
+            if (!memory) return null;
+            return `${PREFIX}\\n${memory}\\n${SUFFIX}\\n${userText}`;
+          }
+          '''
+          s = s[:start] + replacement + s[end:]
+          s = s.replace('메시지에 숨은 기억 자동 삽입', '메시지에 장기기억만 자동 삽입', 1)
+          path.write_text(s, encoding='utf-8')
+          PY
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add zeta-memory-tampermonkey.user.js
+          if ! git diff --cached --quiet; then
+            git commit -m "Inject long memory only in outgoing messages [skip ci]"
+            git push
+          fi
