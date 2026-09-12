@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Zeta 외장 장기기억
 // @namespace    https://zeta-ai.io/
-// @version      1.3.2
+// @version      1.4.0
 // @description  방별 최근 50턴, AI 장기기억 요약, 암호화 GitHub 동기화를 제공합니다.
 // @author       local
 // @match        https://zeta-ai.io/*
@@ -110,6 +110,11 @@
         state: String(room.summaryStatus?.state || "idle"),
         message: String(room.summaryStatus?.message || ""),
         updatedAt: Number(room.summaryStatus?.updatedAt || 0)
+      },
+      fullImport: {
+        completedAt: Number(room.fullImport?.completedAt || 0),
+        found: Number(room.fullImport?.found || 0),
+        added: Number(room.fullImport?.added || 0)
       },
       updatedAt: Number(room.updatedAt || 0)
     };
@@ -410,6 +415,34 @@
     return { found: collected.length, added };
   }
 
+  async function collectFullHistory(roomId) {
+    if (!roomId) throw new Error("현재 대화방을 확인할 수 없습니다.");
+    const scroller = findMessageScroller();
+    if (!scroller) throw new Error("대화 스크롤 영역을 찾지 못했습니다.");
+    scroller.scrollTop = scroller.scrollHeight;
+    scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    let collected = collectDomTurns(2000), stable = 0, priorHeight = -1, priorCount = collected.length;
+    for (let attempt = 0; attempt < 160 && stable < 5; attempt++) {
+      status(`최초 전체 대화를 불러오는 중… ${collected.length}턴 발견`);
+      scroller.scrollTop = 0;
+      scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 750));
+      collected = mergeDomBatches(collectDomTurns(2000), collected);
+      const unchanged = scroller.scrollHeight === priorHeight && collected.length === priorCount;
+      stable = unchanged ? stable + 1 : 0;
+      priorHeight = scroller.scrollHeight; priorCount = collected.length;
+    }
+    scroller.scrollTop = scroller.scrollHeight;
+    const added = await importDomItems(roomId, collected, "최초 전체 대화 구축", true);
+    const state = await getState();
+    const room = state.rooms[roomId] ||= normalizeRoom({}, roomId);
+    room.fullImport = { completedAt: now(), found: collected.length, added };
+    room.updatedAt = now();
+    await saveState(state, "최초 전체 대화 구축 완료");
+    return { found: collected.length, added, batches: Math.ceil(added / SUMMARY_BATCH_SIZE) };
+  }
+
   async function buildContext(roomId, userText) {
     const settings = await getSettings();
     if (!settings.enabled) return null;
@@ -572,6 +605,7 @@
         url: (a.updatedAt >= b.updatedAt ? a.url : b.url) || a.url || b.url,
         turns, pendingSummary: uniqueBy(pending, "queueId"), seenTurnIds: [...new Set([...(a.seenTurnIds || []), ...(b.seenTurnIds || [])])].slice(-5000), longMemory: mergeMemory(a.longMemory, b.longMemory),
         summaryStatus: (a.summaryStatus?.updatedAt || 0) >= (b.summaryStatus?.updatedAt || 0) ? a.summaryStatus : b.summaryStatus,
+        fullImport: (a.fullImport?.completedAt || 0) >= (b.fullImport?.completedAt || 0) ? a.fullImport : b.fullImport,
         updatedAt: Math.max(a.updatedAt, b.updatedAt)
       }, id);
     }
@@ -681,7 +715,7 @@
     const overlay = document.createElement("div"); overlay.id = "zlm-overlay"; overlay.hidden = true;
     overlay.innerHTML = `<div class="zlm-shell"><header class="zlm-head"><h1>🧠 Zeta 외장 장기기억</h1><div class="zlm-head-actions"><button class="zlm-head-btn" data-action="refresh">↻ 새로고침</button><button class="zlm-head-btn" data-action="toggle-settings">⚙ 환경설정</button><button class="zlm-close" data-action="close">×</button></div></header><main class="zlm-body">
       <div id="zlm-status" class="zlm-status"></div>
-      <section class="zlm-panel"><h2>현재 대화방</h2><p id="zlm-room-info"></p><div class="zlm-meta" id="zlm-room-meta"></div><div class="zlm-health"><div class="zlm-health-card"><strong id="zlm-turn-count">0</strong><span>수집된 최근 턴</span></div><div class="zlm-health-card"><strong id="zlm-pending-count">0</strong><span>요약 대기 턴</span></div><div class="zlm-health-card"><strong id="zlm-memory-count">0/9</strong><span>채워진 기억 블록</span></div></div><div id="zlm-summary-state" class="zlm-summary-state"></div><div id="zlm-memory-blocks" class="zlm-memory-blocks"></div><details class="zlm-turns"><summary>수집된 최근 대화 확인</summary><div id="zlm-turn-list"></div></details><div class="zlm-actions"><button class="zlm-btn primary" data-action="collect-past">과거 대화 수집</button><button class="zlm-btn" data-action="summarize">대기열 지금 요약</button><button class="zlm-btn danger" data-action="delete-room">이 방 로컬 데이터 삭제</button></div><details style="margin-top:10px"><summary style="cursor:pointer;font-size:12px;font-weight:700">장기기억 직접 편집</summary><label class="zlm-field zlm-wide" style="margin-top:8px"><span>Markdown 문서</span><textarea id="zlm-memory" placeholder="요약이 완료되면 이 방의 장기기억이 여기에 표시됩니다."></textarea><button class="zlm-btn primary" data-action="save-memory">장기기억 저장</button></label></details></section>
+      <section class="zlm-panel"><h2>현재 대화방</h2><p id="zlm-room-info"></p><div class="zlm-meta" id="zlm-room-meta"></div><div class="zlm-health"><div class="zlm-health-card"><strong id="zlm-turn-count">0</strong><span>수집된 최근 턴</span></div><div class="zlm-health-card"><strong id="zlm-pending-count">0</strong><span>요약 대기 턴</span></div><div class="zlm-health-card"><strong id="zlm-memory-count">0/9</strong><span>채워진 기억 블록</span></div></div><div id="zlm-summary-state" class="zlm-summary-state"></div><div id="zlm-import-state" class="zlm-note"></div><div id="zlm-memory-blocks" class="zlm-memory-blocks"></div><details class="zlm-turns"><summary>수집된 최근 대화 확인</summary><div id="zlm-turn-list"></div></details><div class="zlm-actions"><button id="zlm-full-import" class="zlm-btn primary" data-action="collect-full">최초 전체 대화 구축</button><button class="zlm-btn" data-action="collect-past">최근 50턴 확인</button><button class="zlm-btn" data-action="summarize">대기열 지금 요약</button><button class="zlm-btn danger" data-action="delete-room">이 방 로컬 데이터 삭제</button></div><details style="margin-top:10px"><summary style="cursor:pointer;font-size:12px;font-weight:700">장기기억 직접 편집</summary><label class="zlm-field zlm-wide" style="margin-top:8px"><span>Markdown 문서</span><textarea id="zlm-memory" placeholder="요약이 완료되면 이 방의 장기기억이 여기에 표시됩니다."></textarea><button class="zlm-btn primary" data-action="save-memory">장기기억 저장</button></label></details></section>
       <div id="zlm-settings" class="zlm-settings" hidden><div class="zlm-settings-dialog"><header class="zlm-settings-head"><h2>⚙ 환경설정</h2><button class="zlm-close" data-action="toggle-settings">×</button></header><div class="zlm-settings-content"><section class="zlm-panel"><h2>동기화</h2><p>비공개 GitHub 저장소의 암호화 JSON 하나로 동기화합니다.</p><div class="zlm-note">토큰에는 해당 비공개 저장소의 Contents 읽기/쓰기 권한만 부여하세요. 토큰·암호화 비밀번호·OpenRouter 키는 동기화와 백업에서 제외되어 각 기기에만 남습니다.</div><div class="zlm-grid" style="margin-top:10px">
         <label class="zlm-field"><span>GitHub 소유자</span><input id="zlm-gh-owner" autocomplete="off"></label><label class="zlm-field"><span>저장소 이름</span><input id="zlm-gh-repo" autocomplete="off"></label><label class="zlm-field"><span>브랜치</span><input id="zlm-gh-branch" placeholder="main"></label><label class="zlm-field"><span>파일 경로</span><input id="zlm-gh-path" placeholder="zeta-memory.encrypted.json"></label><label class="zlm-field zlm-wide"><span>Fine-grained Token (기기 로컬 전용)</span><input id="zlm-gh-token" type="password" autocomplete="new-password"></label><label class="zlm-field zlm-wide"><span>암호화 비밀번호 (기기 로컬 전용)</span><input id="zlm-password" type="password" autocomplete="new-password"></label><label class="zlm-check zlm-wide"><input id="zlm-auto-sync" type="checkbox"> 방 진입 Pull · 응답/기억 변경 Push</label>
       </div><div class="zlm-actions"><button class="zlm-btn primary" data-action="save-sync">동기화 설정 저장</button><button class="zlm-btn" data-action="sync">지금 Pull + 병합 + Push</button><button class="zlm-btn" data-action="pull">Pull만</button><button class="zlm-btn" data-action="push">Push만</button></div></section>
@@ -707,6 +741,9 @@
     const summaryNode = document.getElementById("zlm-summary-state"), summaryState = room?.summaryStatus || {};
     summaryNode.dataset.state = summaryState.state || "idle";
     summaryNode.textContent = summaryState.message ? `요약 상태: ${summaryState.message}${summaryState.updatedAt ? ` (${new Date(summaryState.updatedAt).toLocaleString()})` : ""}` : (pendingCount ? "요약 대기 중입니다. OpenRouter 키와 연결 상태를 확인하거나 ‘대기열 지금 요약’을 눌러주세요." : room?.longMemory.updatedAt ? `장기기억 갱신 완료 · ${new Date(room.longMemory.updatedAt).toLocaleString()}` : "아직 생성된 장기기억이 없습니다.");
+    const importNode = document.getElementById("zlm-import-state"), fullImport = room?.fullImport || {};
+    importNode.textContent = fullImport.completedAt ? `전체 구축 완료 · ${fullImport.found}턴 확인 · ${fullImport.added}턴 신규 수집 · ${new Date(fullImport.completedAt).toLocaleString()}` : "최초 전체 구축을 실행하면 직접 스크롤하지 않아도 맨 아래부터 맨 위까지 불러와 10턴씩 요약합니다.";
+    document.getElementById("zlm-full-import").textContent = fullImport.completedAt ? "전체 대화 다시 확인" : "최초 전체 대화 구축";
     const blockRoot = document.getElementById("zlm-memory-blocks"); blockRoot.replaceChildren();
     for (const [title, key] of blockEntries) {
       const card = document.createElement("div"); card.className = "zlm-memory-block";
@@ -786,6 +823,7 @@
       button.disabled = true;
       if (action === "refresh") { await importDomTurns(roomIdFromUrl()); await refreshPanel(); status("현재 기억 상태를 새로고침했습니다."); }
       else if (action === "toggle-settings") { const node = document.getElementById("zlm-settings"); node.hidden = !node.hidden; const trigger = document.querySelector(".zlm-head-actions [data-action='toggle-settings']"); if (trigger) trigger.textContent = node.hidden ? "⚙ 환경설정" : "⚙ 설정 닫기"; }
+      else if (action === "collect-full") { const result = await collectFullHistory(roomIdFromUrl()); status(`전체 수집 완료 · ${result.found}턴 발견 · ${result.added}턴 신규 · 최대 ${result.batches}회 요약 대기`); }
       else if (action === "collect-past") { const result = await collectPastTurns(roomIdFromUrl()); status(`과거 대화 수집 완료 · 화면에서 ${result.found}턴 확인 · 새로 ${result.added}턴 저장`); }
       else if (action === "save-memory") { await saveMemoryDocument(); status("장기기억을 저장했습니다."); }
       else if (action === "summarize") { const id = roomIdFromUrl(); status("요약 대기열을 처리하는 중…"); await runSummaryQueue(id, true); status("요약 대기열 처리가 끝났습니다."); }
