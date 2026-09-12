@@ -1,0 +1,45 @@
+name: ZLM one-time patch 1.5.5
+
+on:
+  push:
+    paths:
+      - '.github/workflows/zlm-patch-1.5.5.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch userscript
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('zeta-memory-tampermonkey.user.js')
+          s = p.read_text(encoding='utf-8')
+          s = s.replace('// @version      1.5.4', '// @version      1.5.5', 1)
+          old = '''      else if (action === "save-sync") { await saveSyncForm(); status("동기화 설정을 기기에 저장했습니다."); }'''
+          new = '''      else if (action === "save-sync") { await saveSyncForm(); status("동기화 설정을 기기에 저장했습니다."); showToast("동기화 설정 저장 완료"); }'''
+          if old not in s:
+              raise SystemExit('save-sync target not found')
+          s = s.replace(old, new, 1)
+          old = '''      else if (action === "test-ai") { await saveMainForm(); await askAI("연결 확인. OK만 출력한다."); status("OpenRouter 연결에 성공했습니다."); }'''
+          new = '''      else if (action === "test-ai") { await saveMainForm(); status("OpenRouter 연결 시험 중…"); const reply = await askAI("연결 확인. OK만 출력한다."); if (!String(reply || "").trim()) throw new Error("OpenRouter 응답이 비어 있습니다."); status("OpenRouter 연결에 성공했습니다."); showToast("OpenRouter 연결 성공"); }'''
+          if old not in s:
+              raise SystemExit('test-ai target not found')
+          s = s.replace(old, new, 1)
+          old = '''    } catch (error) { status(`${error.message} 로컬 데이터는 유지됩니다.`); } finally { button.disabled = false; }'''
+          new = '''    } catch (error) { status(`${error.message} 로컬 데이터는 유지됩니다.`); showToast(error.message || "작업에 실패했습니다.", true); } finally { button.disabled = false; }'''
+          if old not in s:
+              raise SystemExit('catch target not found')
+          s = s.replace(old, new, 1)
+          p.write_text(s, encoding='utf-8')
+      - name: Commit patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add zeta-memory-tampermonkey.user.js
+          git commit -m "Fix settings save and connection test feedback" || exit 0
+          git push
