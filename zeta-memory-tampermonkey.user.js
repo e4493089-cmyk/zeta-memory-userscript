@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Zeta 외장 장기기억
 // @namespace    https://zeta-ai.io/
-// @version      1.5.4
+// @version      1.5.5
 // @description  최초 전체 대화 Claude 분할 누적 구축, 최근 50턴 로컬 보관, Gemini 증분 요약, 전송 시 장기기억만 삽입합니다.
 // @author       local
 // @match        https://zeta-ai.io/*
@@ -917,15 +917,15 @@
         status("요약 대기열을 처리하는 중…"); await runSummaryQueue(id, true); status("요약 대기열 처리가 끝났습니다.");
       }
       else if (action === "delete-room") { if (await deleteRoom()) status("방 데이터를 삭제했습니다."); }
-      else if (action === "save-sync") { await saveSyncForm(); status("동기화 설정을 기기에 저장했습니다."); }
+      else if (action === "save-sync") { await saveSyncForm(); status("동기화 설정을 기기에 저장했습니다."); showToast("동기화 설정 저장 완료"); }
       else if (action === "sync" || action === "pull" || action === "push") { await saveSyncForm(); status("동기화 중…"); await syncNow(action === "sync" ? "both" : action); status("동기화가 끝났습니다."); }
       else if (action === "save-main") { await saveMainForm(); status("OpenRouter와 문맥 설정을 저장했습니다."); }
-      else if (action === "test-ai") { await saveMainForm(); await askAI("연결 확인. OK만 출력한다."); status("OpenRouter 연결에 성공했습니다."); }
+      else if (action === "test-ai") { await saveMainForm(); status("OpenRouter 연결 시험 중…"); const reply = await askAI("연결 확인. OK만 출력한다."); if (!String(reply || "").trim()) throw new Error("OpenRouter 응답이 비어 있습니다."); status("OpenRouter 연결에 성공했습니다."); showToast("OpenRouter 연결 성공"); }
       else if (action === "backup") await backupData();
       else if (action === "restore") document.getElementById("zlm-file").click();
       else if (action === "recover") { await recoverSnapshot(); status("스냅샷을 병합 복구했습니다."); }
       await refreshPanel();
-    } catch (error) { status(`${error.message} 로컬 데이터는 유지됩니다.`); } finally { button.disabled = false; }
+    } catch (error) { status(`${error.message} 로컬 데이터는 유지됩니다.`); showToast(error.message || "작업에 실패했습니다.", true); } finally { button.disabled = false; }
   }
 
   if (globalThis.__ZLM_TEST__) {
