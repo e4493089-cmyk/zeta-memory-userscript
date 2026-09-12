@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Zeta 외장 장기기억
 // @namespace    https://zeta-ai.io/
-// @version      1.1.4
+// @version      1.2.0
 // @description  방별 최근 50턴, AI 장기기억 요약, 암호화 GitHub 동기화를 제공합니다.
 // @author       local
 // @match        https://zeta-ai.io/*
@@ -320,23 +320,80 @@
     return turns;
   }
 
-  async function importDomTurns(roomId) {
-    const items = collectDomTurns();
-    if (!roomId || !items.length) return;
+  function domTurnKey(item) { return hashText(`${clean(item.user)}\n${clean(item.ai)}`); }
+
+  function mergeDomBatches(older, newer) {
+    const seen = new Set(), result = [];
+    for (const item of [...older, ...newer]) {
+      const key = domTurnKey(item);
+      if (seen.has(key)) continue;
+      seen.add(key); result.push(item);
+    }
+    return result;
+  }
+
+  function findMessageScroller() {
+    const message = document.querySelector('[id^="message-MESSAGE-"], [data-message-id], [data-testid="message"]');
+    for (let node = message?.parentElement; node && node !== document.body; node = node.parentElement) {
+      const style = getComputedStyle(node);
+      if (/(auto|scroll)/.test(style.overflowY) && node.scrollHeight > node.clientHeight + 80) return node;
+    }
+    const candidates = [...document.querySelectorAll("main div, main section")].filter((node) => node.scrollHeight > node.clientHeight * 1.5 && node.clientHeight > 250);
+    return candidates.sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight))[0] || document.scrollingElement;
+  }
+
+  async function importDomItems(roomId, items, reason = "화면 대화 수집", prepend = false) {
+    if (!roomId || !items.length) return 0;
     const state = await getState();
     const room = state.rooms[roomId] ||= normalizeRoom({}, roomId);
-    let changed = false;
-    for (const [i, item] of items.entries()) {
-      const id = `dom-${roomId}-${hashText(`${item.user}\n${item.ai}`)}`;
+    const candidates = [];
+    for (const item of items) {
+      const id = `dom-${roomId}-${domTurnKey(item)}`;
       if (!room.turns.some((t) => t.turnId === id || (t.user === item.user && t.ai === item.ai))) {
-        room.turns.push(normalizeTurn({ ...item, turnId: id, timestamp: now() - items.length + i }, roomId, i)); changed = true;
+        candidates.push({ ...item, turnId: id });
       }
     }
-    if (!changed) return;
+    const existingOldest = room.turns.length ? Math.min(...room.turns.map((t) => t.timestamp)) : now();
+    const baseTime = prepend && room.turns.length ? existingOldest - candidates.length - 1 : now() - candidates.length;
+    const added = candidates.map((item, i) => normalizeTurn({ ...item, timestamp: baseTime + i }, roomId, i));
+    if (!added.length) return 0;
+    room.turns.push(...added);
+    for (let i = 0; i < added.length; i += 10) {
+      const turns = added.slice(i, i + 10), queueId = `domqueue-${hashText(turns.map((t) => t.turnId).join("|"))}`;
+      if (!state.processedQueueIds.includes(queueId) && !room.pendingSummary.some((q) => q.queueId === queueId)) room.pendingSummary.push({ queueId, timestamp: now(), turns });
+    }
     room.turns.sort((a, b) => a.timestamp - b.timestamp);
-    if (room.turns.length > MAX_TURNS) room.pendingSummary.push({ queueId: uid("domqueue"), timestamp: now(), turns: room.turns.splice(0, room.turns.length - MAX_TURNS) });
-    await saveState(state, "화면 대화 수집");
+    if (room.turns.length > MAX_TURNS) room.turns.splice(0, room.turns.length - MAX_TURNS);
+    room.updatedAt = now();
+    await saveState(state, reason);
     runSummaryQueue(roomId);
+    return added.length;
+  }
+
+  async function importDomTurns(roomId) {
+    const items = collectDomTurns();
+    return importDomItems(roomId, items);
+  }
+
+  async function collectPastTurns(roomId) {
+    if (!roomId) throw new Error("현재 대화방을 확인할 수 없습니다.");
+    const scroller = findMessageScroller();
+    if (!scroller) throw new Error("대화 스크롤 영역을 찾지 못했습니다.");
+    let collected = collectDomTurns(500), stable = 0, priorTop = -1, priorCount = collected.length;
+    for (let attempt = 0; attempt < 80 && stable < 4; attempt++) {
+      status(`과거 대화를 불러오는 중… 화면에서 ${collected.length}턴 확인`);
+      const beforeHeight = scroller.scrollHeight;
+      scroller.scrollTop = 0;
+      scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      const current = collectDomTurns(500);
+      collected = mergeDomBatches(current, collected);
+      const unchanged = scroller.scrollTop === priorTop && scroller.scrollHeight === beforeHeight && collected.length === priorCount;
+      stable = unchanged ? stable + 1 : 0;
+      priorTop = scroller.scrollTop; priorCount = collected.length;
+    }
+    const added = await importDomItems(roomId, collected, "과거 대화 수집", true);
+    return { found: collected.length, added };
   }
 
   async function buildContext(roomId, userText) {
@@ -575,7 +632,7 @@
   GM_addStyle(`
     #zlm-button{position:fixed;right:14px;bottom:82px;z-index:2147483000;border:0;border-radius:999px;padding:11px 15px;color:#fff;background:linear-gradient(135deg,#6558d8,#9674e7);box-shadow:0 8px 25px #3d347455;font:700 13px system-ui;cursor:pointer}
     #zlm-overlay{position:fixed;inset:0;z-index:2147483600;padding:14px;background:#32304466;backdrop-filter:blur(5px);font-family:system-ui,-apple-system,"Noto Sans KR",sans-serif;color:#29283a;overflow:auto}#zlm-overlay[hidden]{display:none}#zlm-overlay,#zlm-overlay *{box-sizing:border-box}
-    .zlm-shell{width:min(920px,100%);margin:auto;border:1px solid #dddfea;border-radius:20px;background:#f7f7fb;box-shadow:0 25px 80px #25223855;overflow:hidden}.zlm-head{position:sticky;top:0;z-index:2;display:flex;justify-content:space-between;align-items:center;padding:15px 18px;background:#fffffff2;border-bottom:1px solid #e5e5ed}.zlm-head h1{margin:0;font-size:18px}.zlm-close{border:0;background:none;font-size:27px;cursor:pointer}.zlm-body{display:grid;gap:12px;padding:13px}.zlm-panel{padding:15px;border:1px solid #e3e4ec;border-radius:14px;background:#fff}.zlm-panel h2{margin:0 0 5px;font-size:16px}.zlm-panel p{margin:0 0 11px;color:#77798b;font-size:12px;line-height:1.5}.zlm-grid{display:grid;grid-template-columns:1fr 1fr;gap:9px}.zlm-wide{grid-column:1/-1}.zlm-field{display:grid;gap:5px;color:#555668;font-size:12px;font-weight:700}.zlm-field input,.zlm-field textarea{width:100%;border:1px solid #d7d9e4;border-radius:9px;padding:9px 10px;font:inherit}.zlm-field textarea{min-height:280px;resize:vertical;line-height:1.55}.zlm-check{display:flex;align-items:center;gap:7px;font-size:12px}.zlm-actions{display:flex;flex-wrap:wrap;gap:7px;margin-top:10px}.zlm-btn{border:1px solid #d7d9e4;border-radius:9px;padding:8px 11px;color:#505164;background:#fff;font:700 12px system-ui;cursor:pointer}.zlm-btn.primary{border-color:transparent;color:#fff;background:#6d61d7}.zlm-btn.danger{color:#b43847;background:#fff2f3;border-color:#f0c9ce}.zlm-status{padding:9px 11px;border-radius:9px;color:#5b52a4;background:#efedff;font-size:12px}.zlm-status:empty{display:none}.zlm-meta{display:flex;flex-wrap:wrap;gap:8px;color:#6e7082;font-size:12px}.zlm-note{padding:8px;border-radius:8px;background:#fff8df;color:#765f1b;font-size:11px;line-height:1.5}.zlm-health{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:12px 0}.zlm-health-card{padding:10px;border:1px solid #e5e5ed;border-radius:10px;background:#fafaff}.zlm-health-card strong{display:block;margin-bottom:4px;font-size:18px;color:#51499e}.zlm-health-card span{font-size:11px;color:#747587}.zlm-summary-state{margin:8px 0;padding:9px 11px;border-radius:9px;background:#f2f3f8;font-size:12px;white-space:pre-wrap}.zlm-summary-state[data-state="success"]{color:#26734a;background:#eaf8f0}.zlm-summary-state[data-state="error"]{color:#a42d3c;background:#fff0f1}.zlm-summary-state[data-state="running"]{color:#655200;background:#fff8d9}.zlm-memory-blocks{display:grid;gap:8px;margin:10px 0}.zlm-memory-block{padding:10px;border:1px solid #e3e4ec;border-radius:10px;background:#fbfbfe}.zlm-memory-block h3{margin:0 0 5px;font-size:12px;color:#51499e}.zlm-memory-block div{font-size:12px;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere}.zlm-empty{color:#9293a2}.zlm-turns{margin-top:10px}.zlm-turns summary{cursor:pointer;font-size:12px;font-weight:700;color:#555668}.zlm-turn{margin-top:7px;padding:9px;border-left:3px solid #c8c3f4;background:#fafaff;font-size:11px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}#zlm-toast{position:fixed;left:50%;bottom:24px;z-index:2147483647;max-width:calc(100vw - 28px);padding:10px 14px;border-radius:10px;color:#fff;background:#4f4a76;box-shadow:0 8px 25px #0004;font:700 12px system-ui;transform:translateX(-50%)}#zlm-toast.error{background:#b43e4a}
+    .zlm-shell{width:min(920px,100%);margin:auto;border:1px solid #dddfea;border-radius:20px;background:#f7f7fb;box-shadow:0 25px 80px #25223855;overflow:hidden}.zlm-head{position:sticky;top:0;z-index:2;display:flex;justify-content:space-between;align-items:center;padding:15px 18px;background:#fffffff2;border-bottom:1px solid #e5e5ed}.zlm-head h1{margin:0;font-size:18px}.zlm-head-actions{display:flex;align-items:center;gap:6px}.zlm-head-btn{border:1px solid #dddfea;border-radius:8px;padding:7px 9px;background:#fff;color:#555668;font:700 11px system-ui;cursor:pointer}.zlm-close{border:0;background:none;font-size:27px;cursor:pointer}.zlm-settings[hidden]{display:none}.zlm-settings{display:grid;gap:12px}.zlm-body{display:grid;gap:12px;padding:13px}.zlm-panel{padding:15px;border:1px solid #e3e4ec;border-radius:14px;background:#fff}.zlm-panel h2{margin:0 0 5px;font-size:16px}.zlm-panel p{margin:0 0 11px;color:#77798b;font-size:12px;line-height:1.5}.zlm-grid{display:grid;grid-template-columns:1fr 1fr;gap:9px}.zlm-wide{grid-column:1/-1}.zlm-field{display:grid;gap:5px;color:#555668;font-size:12px;font-weight:700}.zlm-field input,.zlm-field textarea{width:100%;border:1px solid #d7d9e4;border-radius:9px;padding:9px 10px;font:inherit}.zlm-field textarea{min-height:280px;resize:vertical;line-height:1.55}.zlm-check{display:flex;align-items:center;gap:7px;font-size:12px}.zlm-actions{display:flex;flex-wrap:wrap;gap:7px;margin-top:10px}.zlm-btn{border:1px solid #d7d9e4;border-radius:9px;padding:8px 11px;color:#505164;background:#fff;font:700 12px system-ui;cursor:pointer}.zlm-btn.primary{border-color:transparent;color:#fff;background:#6d61d7}.zlm-btn.danger{color:#b43847;background:#fff2f3;border-color:#f0c9ce}.zlm-status{padding:9px 11px;border-radius:9px;color:#5b52a4;background:#efedff;font-size:12px}.zlm-status:empty{display:none}.zlm-meta{display:flex;flex-wrap:wrap;gap:8px;color:#6e7082;font-size:12px}.zlm-note{padding:8px;border-radius:8px;background:#fff8df;color:#765f1b;font-size:11px;line-height:1.5}.zlm-health{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:12px 0}.zlm-health-card{padding:10px;border:1px solid #e5e5ed;border-radius:10px;background:#fafaff}.zlm-health-card strong{display:block;margin-bottom:4px;font-size:18px;color:#51499e}.zlm-health-card span{font-size:11px;color:#747587}.zlm-summary-state{margin:8px 0;padding:9px 11px;border-radius:9px;background:#f2f3f8;font-size:12px;white-space:pre-wrap}.zlm-summary-state[data-state="success"]{color:#26734a;background:#eaf8f0}.zlm-summary-state[data-state="error"]{color:#a42d3c;background:#fff0f1}.zlm-summary-state[data-state="running"]{color:#655200;background:#fff8d9}.zlm-memory-blocks{display:grid;gap:8px;margin:10px 0}.zlm-memory-block{padding:10px;border:1px solid #e3e4ec;border-radius:10px;background:#fbfbfe}.zlm-memory-block h3{margin:0 0 5px;font-size:12px;color:#51499e}.zlm-memory-block div{font-size:12px;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere}.zlm-empty{color:#9293a2}.zlm-turns{margin-top:10px}.zlm-turns summary{cursor:pointer;font-size:12px;font-weight:700;color:#555668}.zlm-turn{margin-top:7px;padding:9px;border-left:3px solid #c8c3f4;background:#fafaff;font-size:11px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}#zlm-toast{position:fixed;left:50%;bottom:24px;z-index:2147483647;max-width:calc(100vw - 28px);padding:10px 14px;border-radius:10px;color:#fff;background:#4f4a76;box-shadow:0 8px 25px #0004;font:700 12px system-ui;transform:translateX(-50%)}#zlm-toast.error{background:#b43e4a}
     @media(max-width:620px){#zlm-overlay{padding:0}.zlm-shell{width:100vw;min-height:100vh;border:0;border-radius:0}.zlm-body{padding:9px}.zlm-grid{grid-template-columns:minmax(0,1fr)}.zlm-wide{grid-column:auto}.zlm-panel{min-width:0;padding:13px}.zlm-field textarea{min-height:220px}.zlm-actions .zlm-btn{flex:1 1 125px}.zlm-head{padding:12px 14px}.zlm-health{grid-template-columns:1fr}}
   `);
 
@@ -594,14 +651,14 @@
   function ensurePanel() {
     if (document.getElementById("zlm-overlay")) return;
     const overlay = document.createElement("div"); overlay.id = "zlm-overlay"; overlay.hidden = true;
-    overlay.innerHTML = `<div class="zlm-shell"><header class="zlm-head"><h1>🧠 Zeta 외장 장기기억</h1><button class="zlm-close" data-action="close">×</button></header><main class="zlm-body">
+    overlay.innerHTML = `<div class="zlm-shell"><header class="zlm-head"><h1>🧠 Zeta 외장 장기기억</h1><div class="zlm-head-actions"><button class="zlm-head-btn" data-action="refresh">↻ 새로고침</button><button class="zlm-head-btn" data-action="toggle-settings">⚙ 환경설정</button><button class="zlm-close" data-action="close">×</button></div></header><main class="zlm-body">
       <div id="zlm-status" class="zlm-status"></div>
-      <section class="zlm-panel"><h2>현재 대화방</h2><p id="zlm-room-info"></p><div class="zlm-meta" id="zlm-room-meta"></div><div class="zlm-health"><div class="zlm-health-card"><strong id="zlm-turn-count">0</strong><span>수집된 최근 턴</span></div><div class="zlm-health-card"><strong id="zlm-pending-count">0</strong><span>요약 대기 턴</span></div><div class="zlm-health-card"><strong id="zlm-memory-count">0/9</strong><span>채워진 기억 블록</span></div></div><div id="zlm-summary-state" class="zlm-summary-state"></div><div id="zlm-memory-blocks" class="zlm-memory-blocks"></div><details class="zlm-turns"><summary>수집된 최근 대화 확인</summary><div id="zlm-turn-list"></div></details><div class="zlm-actions"><button class="zlm-btn primary" data-action="save-memory">장기기억 저장</button><button class="zlm-btn" data-action="summarize">대기열 지금 요약</button><button class="zlm-btn danger" data-action="delete-room">이 방 로컬 데이터 삭제</button></div><details style="margin-top:10px"><summary style="cursor:pointer;font-size:12px;font-weight:700">장기기억 직접 편집</summary><label class="zlm-field zlm-wide" style="margin-top:8px"><span>Markdown 문서</span><textarea id="zlm-memory" placeholder="요약이 완료되면 이 방의 장기기억이 여기에 표시됩니다."></textarea></label></details></section>
-      <section class="zlm-panel"><h2>동기화</h2><p>비공개 GitHub 저장소의 암호화 JSON 하나로 동기화합니다.</p><div class="zlm-note">토큰에는 해당 비공개 저장소의 Contents 읽기/쓰기 권한만 부여하세요. 토큰·암호화 비밀번호·OpenRouter 키는 동기화와 백업에서 제외되어 각 기기에만 남습니다.</div><div class="zlm-grid" style="margin-top:10px">
+      <section class="zlm-panel"><h2>현재 대화방</h2><p id="zlm-room-info"></p><div class="zlm-meta" id="zlm-room-meta"></div><div class="zlm-health"><div class="zlm-health-card"><strong id="zlm-turn-count">0</strong><span>수집된 최근 턴</span></div><div class="zlm-health-card"><strong id="zlm-pending-count">0</strong><span>요약 대기 턴</span></div><div class="zlm-health-card"><strong id="zlm-memory-count">0/9</strong><span>채워진 기억 블록</span></div></div><div id="zlm-summary-state" class="zlm-summary-state"></div><div id="zlm-memory-blocks" class="zlm-memory-blocks"></div><details class="zlm-turns"><summary>수집된 최근 대화 확인</summary><div id="zlm-turn-list"></div></details><div class="zlm-actions"><button class="zlm-btn primary" data-action="collect-past">과거 대화 수집</button><button class="zlm-btn" data-action="summarize">대기열 지금 요약</button><button class="zlm-btn danger" data-action="delete-room">이 방 로컬 데이터 삭제</button></div><details style="margin-top:10px"><summary style="cursor:pointer;font-size:12px;font-weight:700">장기기억 직접 편집</summary><label class="zlm-field zlm-wide" style="margin-top:8px"><span>Markdown 문서</span><textarea id="zlm-memory" placeholder="요약이 완료되면 이 방의 장기기억이 여기에 표시됩니다."></textarea><button class="zlm-btn primary" data-action="save-memory">장기기억 저장</button></label></details></section>
+      <div id="zlm-settings" class="zlm-settings" hidden><section class="zlm-panel"><h2>동기화</h2><p>비공개 GitHub 저장소의 암호화 JSON 하나로 동기화합니다.</p><div class="zlm-note">토큰에는 해당 비공개 저장소의 Contents 읽기/쓰기 권한만 부여하세요. 토큰·암호화 비밀번호·OpenRouter 키는 동기화와 백업에서 제외되어 각 기기에만 남습니다.</div><div class="zlm-grid" style="margin-top:10px">
         <label class="zlm-field"><span>GitHub 소유자</span><input id="zlm-gh-owner" autocomplete="off"></label><label class="zlm-field"><span>저장소 이름</span><input id="zlm-gh-repo" autocomplete="off"></label><label class="zlm-field"><span>브랜치</span><input id="zlm-gh-branch" placeholder="main"></label><label class="zlm-field"><span>파일 경로</span><input id="zlm-gh-path" placeholder="zeta-memory.encrypted.json"></label><label class="zlm-field zlm-wide"><span>Fine-grained Token (기기 로컬 전용)</span><input id="zlm-gh-token" type="password" autocomplete="new-password"></label><label class="zlm-field zlm-wide"><span>암호화 비밀번호 (기기 로컬 전용)</span><input id="zlm-password" type="password" autocomplete="new-password"></label><label class="zlm-check zlm-wide"><input id="zlm-auto-sync" type="checkbox"> 방 진입 Pull · 응답/기억 변경 Push</label>
       </div><div class="zlm-actions"><button class="zlm-btn primary" data-action="save-sync">동기화 설정 저장</button><button class="zlm-btn" data-action="sync">지금 Pull + 병합 + Push</button><button class="zlm-btn" data-action="pull">Pull만</button><button class="zlm-btn" data-action="push">Push만</button></div></section>
       <section class="zlm-panel"><h2>OpenRouter와 문맥</h2><div class="zlm-grid"><label class="zlm-field zlm-wide"><span>OpenRouter API 키 (기기 로컬 전용)</span><input id="zlm-or-key" type="password" autocomplete="new-password"></label><label class="zlm-field"><span>모델</span><input id="zlm-model"></label><label class="zlm-field"><span>장기기억 문맥 최대 글자 (최대 4000)</span><input id="zlm-context" type="number" min="500" max="4000"></label><label class="zlm-check zlm-wide"><input id="zlm-enabled" type="checkbox"> 메시지에 숨은 기억 자동 삽입</label></div><div class="zlm-actions"><button class="zlm-btn primary" data-action="save-main">설정 저장</button><button class="zlm-btn" data-action="test-ai">연결 시험</button></div></section>
-      <section class="zlm-panel"><h2>백업·복원·복구</h2><p>일반 JSON 백업에도 비밀값은 포함되지 않습니다. 복원 시 기존 데이터와 병합합니다.</p><div class="zlm-actions"><button class="zlm-btn primary" data-action="backup">JSON 백업</button><button class="zlm-btn" data-action="restore">JSON 복원</button><button class="zlm-btn" data-action="recover">최근 로컬 스냅샷 복구</button><input id="zlm-file" type="file" accept="application/json" hidden></div></section>
+      <section class="zlm-panel"><h2>백업·복원·복구</h2><p>일반 JSON 백업에도 비밀값은 포함되지 않습니다. 복원 시 기존 데이터와 병합합니다.</p><div class="zlm-actions"><button class="zlm-btn primary" data-action="backup">JSON 백업</button><button class="zlm-btn" data-action="restore">JSON 복원</button><button class="zlm-btn" data-action="recover">최근 로컬 스냅샷 복구</button><input id="zlm-file" type="file" accept="application/json" hidden></div></section></div>
     </main></div>`;
     overlay.addEventListener("click", handleClick); overlay.querySelector("#zlm-file").addEventListener("change", restoreBackup); document.body.append(overlay);
   }
@@ -693,7 +750,10 @@
     try {
       if (action === "close") return void (document.getElementById("zlm-overlay").hidden = true);
       button.disabled = true;
-      if (action === "save-memory") { await saveMemoryDocument(); status("장기기억을 저장했습니다."); }
+      if (action === "refresh") { await importDomTurns(roomIdFromUrl()); await refreshPanel(); status("현재 기억 상태를 새로고침했습니다."); }
+      else if (action === "toggle-settings") { const node = document.getElementById("zlm-settings"); node.hidden = !node.hidden; button.textContent = node.hidden ? "⚙ 환경설정" : "⚙ 설정 닫기"; }
+      else if (action === "collect-past") { const result = await collectPastTurns(roomIdFromUrl()); status(`과거 대화 수집 완료 · 화면에서 ${result.found}턴 확인 · 새로 ${result.added}턴 저장`); }
+      else if (action === "save-memory") { await saveMemoryDocument(); status("장기기억을 저장했습니다."); }
       else if (action === "summarize") { const id = roomIdFromUrl(); status("요약 대기열을 처리하는 중…"); await runSummaryQueue(id); status("요약 대기열 처리가 끝났습니다."); }
       else if (action === "delete-room") { if (await deleteRoom()) status("방 데이터를 삭제했습니다."); }
       else if (action === "save-sync") { await saveSyncForm(); status("동기화 설정을 기기에 저장했습니다."); }
