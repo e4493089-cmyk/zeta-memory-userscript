@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Zeta 외장 장기기억
 // @namespace    https://zeta-ai.io/
-// @version      1.2.0
+// @version      1.3.0
 // @description  방별 최근 50턴, AI 장기기억 요약, 암호화 GitHub 동기화를 제공합니다.
 // @author       local
 // @match        https://zeta-ai.io/*
@@ -31,6 +31,8 @@
   const SUFFIX = "[/ZETA_MEMORY_CONTEXT_V2]";
   const SCHEMA = 2;
   const MAX_TURNS = 50;
+  const SUMMARY_BATCH_SIZE = 10;
+  const SHOW_INJECTED_CONTEXT = true;
   const MAX_WIRE = 5000;
   const DEFAULT_CONTEXT = 4000;
   const STORE = {
@@ -97,7 +99,8 @@
     return {
       roomId, roomName: String(room.roomName || ""), url: String(room.url || ""),
       turns: uniqueBy(turns, "turnId").sort((a, b) => a.timestamp - b.timestamp),
-      pendingSummary: uniqueBy(pending, "queueId"),
+      pendingSummary: packPendingTurns(pending),
+      seenTurnIds: [...new Set([...(room.seenTurnIds || []), ...turns.map((t) => t.turnId)])].slice(-5000),
       longMemory: {
         content: String(memory.content || ""), updatedAt: Number(memory.updatedAt || 0),
         blocks: normalizeBlocks(memory.blocks, memory.content), editId: String(memory.editId || ""),
@@ -121,6 +124,16 @@
       if (!old || Number(item.updatedAt || item.timestamp || 0) >= Number(old.updatedAt || old.timestamp || 0)) map.set(id, item);
     }
     return [...map.values()];
+  }
+
+  function packPendingTurns(pending = []) {
+    const turns = uniqueBy(pending.flatMap((batch) => batch.turns || []), "turnId").sort((a, b) => a.timestamp - b.timestamp);
+    const batches = [];
+    for (let i = 0; i < turns.length; i += SUMMARY_BATCH_SIZE) {
+      const part = turns.slice(i, i + SUMMARY_BATCH_SIZE);
+      batches.push({ queueId: `batch10-${hashText(part.map((t) => t.turnId).join("|"))}`, timestamp: Math.min(...part.map((t) => t.timestamp || now())), turns: part });
+    }
+    return batches;
   }
 
   const MEMORY_FIELDS = ["currentSituation", "shortTermMemory", "unresolvedThreads", "characters", "relationships", "eventTimeline", "promisesSecrets", "worldState", "keyDialogue"];
@@ -154,6 +167,7 @@
     for (const [id, room] of Object.entries(raw.rooms || {})) state.rooms[id] = normalizeRoom(room, id);
     state.processedQueueIds = [...new Set(raw.processedQueueIds || [])].slice(-2000);
     state.tombstones = uniqueBy(raw.tombstones || [], "id").slice(-2000);
+    for (const room of Object.values(state.rooms)) room.pendingSummary = room.pendingSummary.filter((q) => !state.processedQueueIds.includes(q.queueId));
     return state;
   }
 
@@ -238,13 +252,13 @@
   }
 
   let summaryChain = Promise.resolve();
-  function runSummaryQueue(roomId) {
+  function runSummaryQueue(roomId, force = false) {
     summaryChain = summaryChain.then(async () => {
       while (true) {
         const state = await getState();
         const room = state.rooms[roomId];
         if (!room) return;
-        const batch = room.pendingSummary.find((q) => !state.processedQueueIds.includes(q.queueId));
+        const batch = room.pendingSummary.find((q) => !state.processedQueueIds.includes(q.queueId) && (force || q.turns.length >= SUMMARY_BATCH_SIZE));
         if (!batch) return;
         try {
           room.summaryStatus = { state: "running", message: `${batch.turns.length}턴을 장기기억에 반영하는 중`, updatedAt: now() };
@@ -289,11 +303,9 @@
     const prior = room.turns.find((t) => t.turnId === turnId);
     if (prior) Object.assign(prior, { user: user || prior.user, ai: aiText || prior.ai, updatedAt: now() });
     else room.turns.push({ turnId, user, ai: aiText, timestamp, updatedAt: now() });
+    room.seenTurnIds = [...new Set([...(room.seenTurnIds || []), turnId])].slice(-5000);
     room.turns = uniqueBy(room.turns, "turnId").sort((a, b) => a.timestamp - b.timestamp);
-    const memoryQueueId = `memory-${turnId}`;
-    if (!state.processedQueueIds.includes(memoryQueueId) && !room.pendingSummary.some((q) => q.queueId === memoryQueueId)) {
-      room.pendingSummary.push({ queueId: memoryQueueId, timestamp: now(), turns: [{ turnId, user, ai: aiText, timestamp, updatedAt: now() }] });
-    }
+    if (!prior && !room.pendingSummary.some((q) => q.turns.some((t) => t.turnId === turnId))) room.pendingSummary = packPendingTurns([...room.pendingSummary, { queueId: uid("pending"), timestamp: now(), turns: [{ turnId, user, ai: aiText, timestamp, updatedAt: now() }] }]);
     if (room.turns.length > MAX_TURNS) {
       room.turns.splice(0, room.turns.length - MAX_TURNS);
     }
@@ -349,7 +361,7 @@
     const candidates = [];
     for (const item of items) {
       const id = `dom-${roomId}-${domTurnKey(item)}`;
-      if (!room.turns.some((t) => t.turnId === id || (t.user === item.user && t.ai === item.ai))) {
+      if (!(room.seenTurnIds || []).includes(id) && !room.turns.some((t) => t.turnId === id || (t.user === item.user && t.ai === item.ai))) {
         candidates.push({ ...item, turnId: id });
       }
     }
@@ -358,10 +370,8 @@
     const added = candidates.map((item, i) => normalizeTurn({ ...item, timestamp: baseTime + i }, roomId, i));
     if (!added.length) return 0;
     room.turns.push(...added);
-    for (let i = 0; i < added.length; i += 10) {
-      const turns = added.slice(i, i + 10), queueId = `domqueue-${hashText(turns.map((t) => t.turnId).join("|"))}`;
-      if (!state.processedQueueIds.includes(queueId) && !room.pendingSummary.some((q) => q.queueId === queueId)) room.pendingSummary.push({ queueId, timestamp: now(), turns });
-    }
+    room.seenTurnIds = [...new Set([...(room.seenTurnIds || []), ...added.map((t) => t.turnId)])].slice(-5000);
+    room.pendingSummary = packPendingTurns([...room.pendingSummary, { queueId: uid("dompending"), timestamp: now(), turns: added }]);
     room.turns.sort((a, b) => a.timestamp - b.timestamp);
     if (room.turns.length > MAX_TURNS) room.turns.splice(0, room.turns.length - MAX_TURNS);
     room.updatedAt = now();
@@ -379,19 +389,23 @@
     if (!roomId) throw new Error("현재 대화방을 확인할 수 없습니다.");
     const scroller = findMessageScroller();
     if (!scroller) throw new Error("대화 스크롤 영역을 찾지 못했습니다.");
-    let collected = collectDomTurns(500), stable = 0, priorTop = -1, priorCount = collected.length;
-    for (let attempt = 0; attempt < 80 && stable < 4; attempt++) {
+    scroller.scrollTop = scroller.scrollHeight;
+    scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    let collected = collectDomTurns(MAX_TURNS), stable = 0, priorTop = -1, priorCount = collected.length;
+    for (let attempt = 0; attempt < 80 && stable < 4 && collected.length < MAX_TURNS; attempt++) {
       status(`과거 대화를 불러오는 중… 화면에서 ${collected.length}턴 확인`);
       const beforeHeight = scroller.scrollHeight;
       scroller.scrollTop = 0;
       scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
       await new Promise((resolve) => setTimeout(resolve, 700));
-      const current = collectDomTurns(500);
-      collected = mergeDomBatches(current, collected);
+      const current = collectDomTurns(MAX_TURNS);
+      collected = mergeDomBatches(current, collected).slice(-MAX_TURNS);
       const unchanged = scroller.scrollTop === priorTop && scroller.scrollHeight === beforeHeight && collected.length === priorCount;
       stable = unchanged ? stable + 1 : 0;
       priorTop = scroller.scrollTop; priorCount = collected.length;
     }
+    scroller.scrollTop = scroller.scrollHeight;
     const added = await importDomItems(roomId, collected, "과거 대화 수집", true);
     return { found: collected.length, added };
   }
@@ -544,7 +558,7 @@
       result.rooms[id] = normalizeRoom({
         roomName: (a.updatedAt >= b.updatedAt ? a.roomName : b.roomName) || a.roomName || b.roomName,
         url: (a.updatedAt >= b.updatedAt ? a.url : b.url) || a.url || b.url,
-        turns, pendingSummary: uniqueBy(pending, "queueId"), longMemory: mergeMemory(a.longMemory, b.longMemory),
+        turns, pendingSummary: uniqueBy(pending, "queueId"), seenTurnIds: [...new Set([...(a.seenTurnIds || []), ...(b.seenTurnIds || [])])].slice(-5000), longMemory: mergeMemory(a.longMemory, b.longMemory),
         summaryStatus: (a.summaryStatus?.updatedAt || 0) >= (b.summaryStatus?.updatedAt || 0) ? a.summaryStatus : b.summaryStatus,
         updatedAt: Math.max(a.updatedAt, b.updatedAt)
       }, id);
@@ -609,6 +623,7 @@
   }
 
   function stripVisibleContext(root = document.body) {
+    if (SHOW_INJECTED_CONTEXT) return;
     if (!root) return;
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
     const nodes = [];
@@ -754,7 +769,7 @@
       else if (action === "toggle-settings") { const node = document.getElementById("zlm-settings"); node.hidden = !node.hidden; button.textContent = node.hidden ? "⚙ 환경설정" : "⚙ 설정 닫기"; }
       else if (action === "collect-past") { const result = await collectPastTurns(roomIdFromUrl()); status(`과거 대화 수집 완료 · 화면에서 ${result.found}턴 확인 · 새로 ${result.added}턴 저장`); }
       else if (action === "save-memory") { await saveMemoryDocument(); status("장기기억을 저장했습니다."); }
-      else if (action === "summarize") { const id = roomIdFromUrl(); status("요약 대기열을 처리하는 중…"); await runSummaryQueue(id); status("요약 대기열 처리가 끝났습니다."); }
+      else if (action === "summarize") { const id = roomIdFromUrl(); status("요약 대기열을 처리하는 중…"); await runSummaryQueue(id, true); status("요약 대기열 처리가 끝났습니다."); }
       else if (action === "delete-room") { if (await deleteRoom()) status("방 데이터를 삭제했습니다."); }
       else if (action === "save-sync") { await saveSyncForm(); status("동기화 설정을 기기에 저장했습니다."); }
       else if (action === "sync" || action === "pull" || action === "push") { await saveSyncForm(); status("동기화 중…"); await syncNow(action === "sync" ? "both" : action); status("동기화가 끝났습니다."); }
