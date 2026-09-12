@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Zeta 외장 장기기억
 // @namespace    https://zeta-ai.io/
-// @version      1.5.3
-// @description  최초 전체 대화 Claude 분할 누적 구축, 최근 50턴 원문, Gemini 증분 요약과 암호화 GitHub 동기화를 제공합니다.
+// @version      1.5.4
+// @description  최초 전체 대화 Claude 분할 누적 구축, 최근 50턴 로컬 보관, Gemini 증분 요약, 전송 시 장기기억만 삽입합니다.
 // @author       local
 // @match        https://zeta-ai.io/*
 // @run-at       document-start
@@ -518,32 +518,24 @@
   }
 
   async function buildContext(roomId, userText) {
-    const settings = await getSettings();
-    if (!settings.enabled) return null;
-    const state = await getState();
-    const room = state.rooms[roomId];
-    if (!room) return null;
-    const blocks = normalizeBlocks(room.longMemory.blocks, room.longMemory.content);
-    const overhead = PREFIX.length + SUFFIX.length + 4;
-    const allowed = Math.max(0, Math.min(4000, Number(settings.maxContextChars) || DEFAULT_CONTEXT, MAX_WIRE - userText.length - overhead));
-    if (allowed < 80) return null;
-    const instruction = `다음은 외장 기억이다. 최신 원문을 최우선 사실로 사용한다. 현재 상태가 충돌하면 가장 최근 메시지를 따르되, 이미 실제로 발생한 키스·약속·폭로 같은 누적 사건은 명시적 설정 수정이 없는 한 없던 일로 만들지 않는다. 인물의 주장과 객관적 사건을 구분한다.\n\n`;
-    const recentBudget = Math.max(300, Math.floor((allowed - instruction.length) * 0.65));
-    const selected = [];
-    let used = 0;
-    for (let i = room.turns.length - 1; i >= 0; i--) {
-      const text = `사용자: ${room.turns[i].user}\nAI: ${room.turns[i].ai}`;
-      if (selected.length && used + text.length > recentBudget) break;
-      selected.unshift(text.length > recentBudget ? text.slice(-recentBudget) : text); used += text.length;
-    }
-    const recent = selected.map((text, i) => `${i + 1}. ${text}`).join("\n\n") || "없음";
-    const memoryBudget = Math.max(0, allowed - instruction.length - recent.length - 60);
-    const priorityMemory = [["주요 사건 타임라인", blocks.eventTimeline], ["약속 · 비밀 · 갈등", blocks.promisesSecrets], ["인물 관계도 · 관계 변화", blocks.relationships], ["현재 상황", blocks.currentSituation], ["등장인물", blocks.characters], ["미해결 떡밥", blocks.unresolvedThreads], ["단기기억 · 지금 진행 중", blocks.shortTermMemory], ["장소 · 물건 · 세계관 설정", blocks.worldState], ["중요한 원문 대사", blocks.keyDialogue]].filter(([, value]) => value).map(([title, value]) => `### ${title}\n${value}`).join("\n\n");
-    const memory = (priorityMemory || "[구조화 기억 없음]").slice(0, memoryBudget);
-    let context = `${instruction}## 최신 원문 대화 (${selected.length}/${room.turns.length}턴)\n${recent}\n\n## 누적 구조화 기억\n${memory}`;
-    context = context.slice(0, allowed);
-    return `${PREFIX}\n${context}\n${SUFFIX}\n${userText}`;
-  }
+  const settings = await getSettings();
+  if (!settings.enabled) return null;
+  const state = await getState();
+  const room = state.rooms[roomId];
+  if (!room) return null;
+  const blocks = normalizeBlocks(room.longMemory.blocks, room.longMemory.content);
+  const overhead = PREFIX.length + SUFFIX.length + 4;
+  const allowed = Math.max(0, Math.min(4000, Number(settings.maxContextChars) || DEFAULT_CONTEXT, MAX_WIRE - userText.length - overhead));
+  if (allowed < 80) return null;
+  const memory = [["주요 사건 타임라인", blocks.eventTimeline], ["약속 · 비밀 · 갈등", blocks.promisesSecrets], ["인물 관계도 · 관계 변화", blocks.relationships], ["현재 상황", blocks.currentSituation], ["등장인물", blocks.characters], ["미해결 떡밥", blocks.unresolvedThreads], ["단기기억 · 지금 진행 중", blocks.shortTermMemory], ["장소 · 물건 · 세계관 설정", blocks.worldState], ["중요한 원문 대사", blocks.keyDialogue]]
+    .filter(([, value]) => value)
+    .map(([title, value]) => `### ${title}\n${value}`)
+    .join("\n\n")
+    .slice(0, allowed)
+    .trim();
+  if (!memory) return null;
+  return `${PREFIX}\n${memory}\n${SUFFIX}\n${userText}`;
+}
 
   function observeComplete(response, roomId) {
     response.clone().text().then((body) => {
@@ -800,7 +792,7 @@
       <div id="zlm-settings" class="zlm-settings" hidden><div class="zlm-settings-dialog"><header class="zlm-settings-head"><h2>⚙ 환경설정</h2><button class="zlm-close" data-action="toggle-settings">×</button></header><div class="zlm-settings-content"><section class="zlm-panel"><h2>동기화</h2><p>비공개 GitHub 저장소의 암호화 JSON 하나로 동기화합니다.</p><div class="zlm-note">토큰에는 해당 비공개 저장소의 Contents 읽기/쓰기 권한만 부여하세요. 토큰·암호화 비밀번호·OpenRouter 키는 동기화와 백업에서 제외되어 각 기기에만 남습니다.</div><div class="zlm-grid" style="margin-top:10px">
         <label class="zlm-field"><span>GitHub 소유자</span><input id="zlm-gh-owner" autocomplete="off"></label><label class="zlm-field"><span>저장소 이름</span><input id="zlm-gh-repo" autocomplete="off"></label><label class="zlm-field"><span>브랜치</span><input id="zlm-gh-branch" placeholder="main"></label><label class="zlm-field"><span>파일 경로</span><input id="zlm-gh-path" placeholder="zeta-memory.encrypted.json"></label><label class="zlm-field zlm-wide"><span>Fine-grained Token (기기 로컬 전용)</span><span class="zlm-secret-row"><input id="zlm-gh-token" type="password" autocomplete="new-password"><button class="zlm-eye" type="button" data-reveal="zlm-gh-token" aria-label="토큰 보기" title="보기/숨기기">👁</button></span></label><label class="zlm-field zlm-wide"><span>암호화 비밀번호 (기기 로컬 전용)</span><input id="zlm-password" type="password" autocomplete="new-password"></label><label class="zlm-check zlm-wide"><input id="zlm-auto-sync" type="checkbox"> 방 진입 Pull · 응답/기억 변경 Push</label>
       </div><div class="zlm-actions"><button class="zlm-btn primary" data-action="save-sync">동기화 설정 저장</button><button class="zlm-btn" data-action="sync">지금 Pull + 병합 + Push</button><button class="zlm-btn" data-action="pull">Pull만</button><button class="zlm-btn" data-action="push">Push만</button></div></section>
-      <section class="zlm-panel"><h2>OpenRouter와 문맥</h2><div class="zlm-grid"><label class="zlm-field zlm-wide"><span>OpenRouter API 키 (기기 로컬 전용)</span><span class="zlm-secret-row"><input id="zlm-or-key" type="password" autocomplete="new-password"><button class="zlm-eye" type="button" data-reveal="zlm-or-key" aria-label="API 키 보기" title="보기/숨기기">👁</button></span></label><label class="zlm-field"><span>최초 전체 구축 모델 (Claude)</span><input id="zlm-initial-model"></label><label class="zlm-field"><span>이후 10턴 요약 모델 (Gemini)</span><input id="zlm-ongoing-model"></label><label class="zlm-field"><span>장기기억 문맥 최대 글자 (최대 4000)</span><input id="zlm-context" type="number" min="500" max="4000"></label><label class="zlm-check zlm-wide"><input id="zlm-enabled" type="checkbox"> 메시지에 숨은 기억 자동 삽입</label></div><div class="zlm-actions"><button class="zlm-btn primary" data-action="save-main">설정 저장</button><button class="zlm-btn" data-action="test-ai">연결 시험</button></div></section>
+      <section class="zlm-panel"><h2>OpenRouter와 문맥</h2><div class="zlm-grid"><label class="zlm-field zlm-wide"><span>OpenRouter API 키 (기기 로컬 전용)</span><span class="zlm-secret-row"><input id="zlm-or-key" type="password" autocomplete="new-password"><button class="zlm-eye" type="button" data-reveal="zlm-or-key" aria-label="API 키 보기" title="보기/숨기기">👁</button></span></label><label class="zlm-field"><span>최초 전체 구축 모델 (Claude)</span><input id="zlm-initial-model"></label><label class="zlm-field"><span>이후 10턴 요약 모델 (Gemini)</span><input id="zlm-ongoing-model"></label><label class="zlm-field"><span>장기기억 문맥 최대 글자 (최대 4000)</span><input id="zlm-context" type="number" min="500" max="4000"></label><label class="zlm-check zlm-wide"><input id="zlm-enabled" type="checkbox"> 메시지에 장기기억만 자동 삽입</label></div><div class="zlm-actions"><button class="zlm-btn primary" data-action="save-main">설정 저장</button><button class="zlm-btn" data-action="test-ai">연결 시험</button></div></section>
       <section class="zlm-panel"><h2>백업·복원·복구</h2><p>일반 JSON 백업에도 비밀값은 포함되지 않습니다. 복원 시 기존 데이터와 병합합니다.</p><div class="zlm-actions"><button class="zlm-btn primary" data-action="backup">JSON 백업</button><button class="zlm-btn" data-action="restore">JSON 복원</button><button class="zlm-btn" data-action="recover">최근 로컬 스냅샷 복구</button><input id="zlm-file" type="file" accept="application/json" hidden></div></section></div></div></div>
     </main></div>`;
     overlay.addEventListener("click", handleClick); overlay.querySelector("#zlm-file").addEventListener("change", restoreBackup); document.body.append(overlay);
