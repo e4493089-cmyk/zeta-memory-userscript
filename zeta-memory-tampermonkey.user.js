@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Zeta 외장 장기기억
 // @namespace    https://zeta-ai.io/
-// @version      1.1.3
+// @version      1.1.4
 // @description  방별 최근 50턴, AI 장기기억 요약, 암호화 GitHub 동기화를 제공합니다.
 // @author       local
 // @match        https://zeta-ai.io/*
@@ -487,7 +487,9 @@
       result.rooms[id] = normalizeRoom({
         roomName: (a.updatedAt >= b.updatedAt ? a.roomName : b.roomName) || a.roomName || b.roomName,
         url: (a.updatedAt >= b.updatedAt ? a.url : b.url) || a.url || b.url,
-        turns, pendingSummary: uniqueBy(pending, "queueId"), longMemory: mergeMemory(a.longMemory, b.longMemory), updatedAt: Math.max(a.updatedAt, b.updatedAt)
+        turns, pendingSummary: uniqueBy(pending, "queueId"), longMemory: mergeMemory(a.longMemory, b.longMemory),
+        summaryStatus: (a.summaryStatus?.updatedAt || 0) >= (b.summaryStatus?.updatedAt || 0) ? a.summaryStatus : b.summaryStatus,
+        updatedAt: Math.max(a.updatedAt, b.updatedAt)
       }, id);
     }
     return result;
@@ -505,11 +507,20 @@
         for (const id of Object.keys(local.rooms)) runSummaryQueue(id);
       }
       if (mode !== "pull") {
-        if (sha === null) { const remote = await githubRead(); sha = remote.sha; local = mergeStates(local, remote.state); }
-        try { await githubWrite(local, sha); }
-        catch (error) {
-          if (!String(error.message).includes("409") && !String(error.message).includes("422")) throw error;
-          const latest = await githubRead(); local = mergeStates(local, latest.state); await set(STORE.state, local); await githubWrite(local, latest.sha);
+        let pushed = false;
+        for (let attempt = 0; attempt < 5 && !pushed; attempt++) {
+          const latestLocal = await getState();
+          const remote = await githubRead();
+          local = mergeStates(mergeStates(local, latestLocal), remote.state);
+          await set(STORE.state, local);
+          try {
+            await githubWrite(local, remote.sha);
+            pushed = true;
+          } catch (error) {
+            const conflict = String(error.message).includes("409") || String(error.message).includes("422");
+            if (!conflict || attempt === 4) throw error;
+            await new Promise((resolve) => setTimeout(resolve, 180 * (attempt + 1)));
+          }
         }
       }
       if (!silent) showToast(mode === "pull" ? "Pull 및 병합 완료" : mode === "push" ? "Push 완료" : "동기화 및 병합 완료");
