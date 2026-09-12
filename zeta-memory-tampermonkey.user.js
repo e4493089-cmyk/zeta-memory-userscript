@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Zeta 외장 장기기억
 // @namespace    https://zeta-ai.io/
-// @version      1.5.0
+// @version      1.5.1
 // @description  최초 전체 대화 Claude 구축, 최근 50턴 원문, Gemini 증분 요약과 암호화 GitHub 동기화를 제공합니다.
 // @author       local
 // @match        https://zeta-ai.io/*
@@ -364,6 +364,19 @@
     return candidates.sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight))[0] || document.scrollingElement;
   }
 
+  function scrollToOlderMessages(scroller) {
+    const reversed = getComputedStyle(scroller).flexDirection === "column-reverse";
+    scroller.scrollTop = reversed ? -Math.max(scroller.scrollHeight, 1000000) : 0;
+    scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+    return reversed;
+  }
+
+  function scrollToNewestMessages(scroller) {
+    const reversed = getComputedStyle(scroller).flexDirection === "column-reverse";
+    scroller.scrollTop = reversed ? 0 : scroller.scrollHeight;
+    scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+  }
+
   async function importDomItems(roomId, items, reason = "화면 대화 수집", prepend = false) {
     if (!roomId || !items.length) return 0;
     const state = await getState();
@@ -401,15 +414,13 @@
     if (!roomId) throw new Error("현재 대화방을 확인할 수 없습니다.");
     const scroller = findMessageScroller();
     if (!scroller) throw new Error("대화 스크롤 영역을 찾지 못했습니다.");
-    scroller.scrollTop = scroller.scrollHeight;
-    scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+    scrollToNewestMessages(scroller);
     await new Promise((resolve) => setTimeout(resolve, 350));
     let collected = collectDomTurns(MAX_TURNS), stable = 0, priorTop = -1, priorCount = collected.length;
     for (let attempt = 0; attempt < 80 && stable < 4 && collected.length < MAX_TURNS; attempt++) {
       status(`과거 대화를 불러오는 중… 화면에서 ${collected.length}턴 확인`);
       const beforeHeight = scroller.scrollHeight;
-      scroller.scrollTop = 0;
-      scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+      scrollToOlderMessages(scroller);
       await new Promise((resolve) => setTimeout(resolve, 700));
       const current = collectDomTurns(MAX_TURNS);
       collected = mergeDomBatches(current, collected).slice(-MAX_TURNS);
@@ -417,7 +428,7 @@
       stable = unchanged ? stable + 1 : 0;
       priorTop = scroller.scrollTop; priorCount = collected.length;
     }
-    scroller.scrollTop = scroller.scrollHeight;
+    scrollToNewestMessages(scroller);
     const added = await importDomItems(roomId, collected, "과거 대화 수집", true);
     return { found: collected.length, added };
   }
@@ -428,21 +439,19 @@
     if (priorRoom?.fullImport?.completedAt && !confirm("이미 최초 전체 구축을 완료했습니다. 전체 이력을 다시 Claude로 정리할까요? 기존 기억은 복구 기록에 보존됩니다.")) return { found: priorRoom.fullImport.found, added: 0, rebuilt: false };
     const scroller = findMessageScroller();
     if (!scroller) throw new Error("대화 스크롤 영역을 찾지 못했습니다.");
-    scroller.scrollTop = scroller.scrollHeight;
-    scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+    scrollToNewestMessages(scroller);
     await new Promise((resolve) => setTimeout(resolve, 400));
     let collected = collectDomTurns(2000), stable = 0, priorHeight = -1, priorCount = collected.length;
     for (let attempt = 0; attempt < 160 && stable < 5; attempt++) {
       status(`최초 전체 대화를 불러오는 중… ${collected.length}턴 발견`);
-      scroller.scrollTop = 0;
-      scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+      scrollToOlderMessages(scroller);
       await new Promise((resolve) => setTimeout(resolve, 750));
       collected = mergeDomBatches(collectDomTurns(2000), collected);
       const unchanged = scroller.scrollHeight === priorHeight && collected.length === priorCount;
       stable = unchanged ? stable + 1 : 0;
       priorHeight = scroller.scrollHeight; priorCount = collected.length;
     }
-    scroller.scrollTop = scroller.scrollHeight;
+    scrollToNewestMessages(scroller);
     if (!collected.length) throw new Error("화면에서 대화를 찾지 못했습니다.");
     const settings = await getSettings();
     const dialogue = collected.map((t, i) => `[${i + 1}] 사용자: ${t.user}\nAI: ${t.ai}`).join("\n\n");
