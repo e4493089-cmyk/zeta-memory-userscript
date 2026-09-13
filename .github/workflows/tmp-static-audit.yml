@@ -1,0 +1,48 @@
+name: Temporary static audit
+
+on:
+  push:
+    paths:
+      - '.github/workflows/tmp-static-audit.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check memory userscripts
+        run: |
+          set -e
+          for f in *.js; do
+            echo "== node --check: $f =="
+            node --check "$f"
+          done
+      - name: Non-behavior static audit
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          for p in sorted(Path('.').glob('*.js')):
+              s = p.read_text(encoding='utf-8')
+              lines = s.splitlines()
+              print(f'== {p.name} ==')
+              print('bytes=', len(s.encode('utf-8')), 'lines=', len(lines))
+              print('eof_newline=', s.endswith('\n'))
+              print('trailing_ws_lines=', sum(bool(re.search(r'[ \t]+$', line)) for line in lines))
+              print('tab_lines=', sum('\t' in line for line in lines))
+              print('debugger=', len(re.findall(r'\bdebugger\s*;', s)))
+              print('console_log=', len(re.findall(r'console\.log\s*\(', s)))
+              print('todo_fixme=', len(re.findall(r'\b(?:TODO|FIXME)\b', s, re.I)))
+              version = re.search(r'^//\s*@version\s+([^\s]+)', s, re.M)
+              update = re.search(r'^//\s*@updateURL\s+(\S+)', s, re.M)
+              download = re.search(r'^//\s*@downloadURL\s+(\S+)', s, re.M)
+              print('version=', version.group(1) if version else 'MISSING')
+              if update: print('update_url=', update.group(1))
+              if download: print('download_url=', download.group(1))
+              if update and p.name not in update.group(1): print('WARNING updateURL filename mismatch')
+              if download and p.name not in download.group(1): print('WARNING downloadURL filename mismatch')
+          PY
